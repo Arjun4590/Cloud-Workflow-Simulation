@@ -43,7 +43,7 @@ export const RESOURCE_DEFINITIONS: Record<ResourceType, ResourceDefinition> = {
       routes_to: ["frontend", "api"]
     },
     acceptsOutgoing: {
-      routes_to: ["service"]
+      routes_to: ["service", "backend"]
     }
   },
   network: {
@@ -245,7 +245,7 @@ export const RESOURCE_DEFINITIONS: Record<ResourceType, ResourceDefinition> = {
       { name: "runtime", label: "Runtime", type: "text", defaultValue: "node" }
     ],
     acceptsIncoming: {
-      routes_to: ["frontend", "api"]
+      routes_to: ["frontend", "api", "load_balancer"]
     },
     acceptsOutgoing: {
       uses: ["sql_database", "nosql_database", "cache"]

@@ -15,6 +15,7 @@ import { v4 as uuidv4 } from 'uuid';
 import CloudNode from '../nodes/CloudNode';
 import { useWorkflowStore } from '../../store/workflowStore';
 import { RESOURCE_DEFINITIONS } from '../../config/resourceDefinitions';
+import { useSimulationStore } from '../../store/simulationStore';
 import type { ResourceType, CloudResource, ConnectionType } from '../../types/workflow';
 
 const nodeTypes = {
@@ -45,6 +46,8 @@ function Canvas() {
     loadProject();
   }, [loadProject]);
 
+  const { snapshot } = useSimulationStore();
+
   // Sync Project State to React Flow Visual State
   useEffect(() => {
     const newNodes: Node[] = project.resources.map(res => ({
@@ -59,15 +62,21 @@ function Canvas() {
     }));
     setNodes(newNodes);
 
-    const newEdges: Edge[] = project.connections.map(conn => ({
-      id: conn.id,
-      source: conn.source,
-      target: conn.target,
-      animated: true,
-      style: { stroke: '#94a3b8', strokeWidth: 2 }
-    }));
+    const activeEdgeSet = new Set(snapshot?.activeEdgeIds || []);
+    const newEdges: Edge[] = project.connections.map(conn => {
+      const isActive = activeEdgeSet.has(conn.id);
+      return {
+        id: conn.id,
+        source: conn.source,
+        target: conn.target,
+        animated: isActive,
+        style: isActive
+          ? { stroke: '#2563eb', strokeWidth: 3.5 }
+          : { stroke: '#94a3b8', strokeWidth: 2 }
+      };
+    });
     setEdges(newEdges);
-  }, [project, positions, selectedResourceId, setNodes, setEdges]);
+  }, [project, positions, selectedResourceId, snapshot?.activeEdgeIds, setNodes, setEdges]);
 
   const onConnect = useCallback(
     (params: Connection) => {

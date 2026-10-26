@@ -25,7 +25,7 @@ export default function AppLayout() {
           <span>Connections: {project.connections.length}</span>
         </div>
         <div>
-          <span>Cloud Workflow Engine — Phase 1</span>
+          <span>CloudLens: Interactive Cloud Execution Visualizer & Simulation Platform</span>
         </div>
       </div>
     </div>

@@ -41,6 +41,7 @@ interface WorkflowState {
   
   saveProject: () => void;
   loadProject: () => void;
+  loadDemoScenario: (project: CloudProject, positions: NodePositions) => void;
   _saveToHistory: () => void;
 }
 
@@ -255,6 +256,22 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
     } catch (e) {
       console.error("Failed to load project from local storage", e);
     }
+  },
+
+  loadDemoScenario: (project, positions) => {
+    get()._saveToHistory();
+    const clonedProject = JSON.parse(JSON.stringify(project));
+    const clonedPositions = JSON.parse(JSON.stringify(positions));
+    const validationResult = ValidationEngine.validate(clonedProject);
+    const executionPlan = WorkflowEngine.buildExecutionPlan(clonedProject);
+    set({
+      project: clonedProject,
+      positions: clonedPositions,
+      selectedResourceId: null,
+      validationResult,
+      executionPlan,
+      isAnalysisPanelOpen: true
+    });
   }
 
 }));

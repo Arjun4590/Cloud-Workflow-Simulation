@@ -6,11 +6,7 @@ export default function PropertiesPanel() {
   const { project, selectedResourceId, updateResource } = useWorkflowStore();
   
   if (!selectedResourceId) {
-    return (
-      <div className="w-80 bg-white border-l border-slate-200 h-full flex items-center justify-center text-slate-400 p-6 text-center">
-        Select a component on the canvas to configure its properties.
-      </div>
-    );
+    return null;
   }
 
   const resource = project.resources.find(r => r.id === selectedResourceId);
