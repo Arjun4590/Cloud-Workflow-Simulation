@@ -3,7 +3,7 @@ import { Handle, Position } from '@xyflow/react';
 import { RESOURCE_DEFINITIONS } from '../../config/resourceDefinitions';
 import { useWorkflowStore } from '../../store/workflowStore';
 import { useSimulationStore } from '../../store/simulationStore';
-import { AlertTriangle, XCircle, CheckCircle2, Zap, Skull, RotateCcw } from 'lucide-react';
+import { AlertTriangle, XCircle, CheckCircle2, Zap, Skull, RotateCcw, Layers } from 'lucide-react';
 import type { CloudResource } from '../../types/workflow';
 
 interface CloudNodeProps {
@@ -36,6 +36,14 @@ const CloudNode = ({ data }: CloudNodeProps) => {
   const runtimeState = runtimeInfo?.state;
   const activeRequests = runtimeInfo?.activeRequests ?? 0;
 
+  // Virtual replicas associated with this backend instance
+  const associatedReplicas = snapshot?.virtualReplicas
+    ? Object.values(snapshot.virtualReplicas).filter(r => r.baseResourceId === resource.id || r.id === resource.id)
+    : [];
+  const readyReplicas = associatedReplicas.filter(r => r.state === "ready" && !r.isFailed);
+  const provisioningReplicas = associatedReplicas.filter(r => r.state === "provisioning");
+  const drainingReplicas = associatedReplicas.filter(r => r.state === "draining");
+
   let borderClass = 'border-slate-200';
   let bgClass = 'bg-white';
 
@@ -47,7 +55,7 @@ const CloudNode = ({ data }: CloudNodeProps) => {
   } else if (runtimeState === 'running') {
     borderClass = 'border-blue-500 shadow-md ring-2 ring-blue-300 animate-pulse';
     bgClass = 'bg-blue-50/30';
-  } else if (runtimeState === 'completed') {
+  } else if (runtimeState === 'completed' || runtimeState === 'ready') {
     borderClass = 'border-emerald-500 ring-1 ring-emerald-300';
   } else if (hasError) {
     borderClass = 'border-red-500 shadow-sm shadow-red-200 ring-1 ring-red-500';
@@ -89,7 +97,7 @@ const CloudNode = ({ data }: CloudNodeProps) => {
             <span className="flex items-center gap-1 bg-blue-600 text-white text-[10px] font-bold px-1.5 py-0.5 rounded-full shadow animate-pulse">
               <Zap size={10} /> {activeRequests > 0 ? `${activeRequests} Active` : 'RUNNING'}
             </span>
-          ) : runtimeState === 'completed' ? (
+          ) : runtimeState === 'completed' || runtimeState === 'ready' ? (
             <span className="flex items-center gap-1 bg-emerald-600 text-white text-[10px] font-bold px-1.5 py-0.5 rounded-full shadow">
               <CheckCircle2 size={10} /> READY
             </span>
@@ -141,6 +149,58 @@ const CloudNode = ({ data }: CloudNodeProps) => {
             ))}
         </div>
       ) : null}
+
+      {/* Autoscaling Replicas Display on Backend Node */}
+      {associatedReplicas.length > 0 && isSimulationActive && (
+        <div className="mt-2 pt-2 border-t border-slate-100 text-[11px] space-y-1">
+          <div className="flex justify-between items-center text-slate-700">
+            <span className="font-semibold flex items-center gap-1 text-[10px]">
+              <Layers size={11} className="text-indigo-600" />
+              <span>Pool Replicas:</span>
+            </span>
+            <span className="font-bold text-indigo-700 font-mono text-[10px] bg-indigo-50 px-1.5 py-0.2 rounded border border-indigo-200">
+              {readyReplicas.length} Ready
+            </span>
+          </div>
+
+          {provisioningReplicas.length > 0 && (
+            <div className="text-[10px] text-amber-700 bg-amber-50 px-1.5 py-0.5 rounded border border-amber-200 flex items-center justify-between">
+              <span>Provisioning:</span>
+              <span className="font-bold font-mono">+{provisioningReplicas.length}</span>
+            </div>
+          )}
+
+          {drainingReplicas.length > 0 && (
+            <div className="text-[10px] text-purple-700 bg-purple-50 px-1.5 py-0.5 rounded border border-purple-200 flex items-center justify-between">
+              <span>Draining:</span>
+              <span className="font-bold font-mono">-{drainingReplicas.length}</span>
+            </div>
+          )}
+
+          {/* Replica mini badges */}
+          <div className="flex flex-wrap gap-1 mt-1 pt-1 border-t border-slate-100">
+            {associatedReplicas.map((rep) => (
+              <span
+                key={rep.id}
+                className={`text-[9px] px-1 py-0.2 rounded font-mono font-medium ${
+                  rep.isFailed 
+                    ? 'bg-red-100 text-red-700 line-through'
+                    : rep.state === 'provisioning'
+                      ? 'bg-amber-100 text-amber-800 animate-pulse'
+                      : rep.state === 'draining'
+                        ? 'bg-purple-100 text-purple-800'
+                        : rep.activeRequests > 0
+                          ? 'bg-blue-100 text-blue-800 font-bold'
+                          : 'bg-emerald-50 text-emerald-700 border border-emerald-200'
+                }`}
+                title={`${rep.name}: ${rep.state}, ${rep.activeRequests} active load`}
+              >
+                {rep.id.includes('-rep-') ? `R${rep.id.split('-rep-')[1]}` : 'Base'}:{rep.activeRequests}
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
 
       {/* Quick Interactive Failure Toggle in Simulation */}
       {isSimulationActive && (

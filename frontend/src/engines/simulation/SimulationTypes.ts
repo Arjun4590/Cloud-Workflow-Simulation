@@ -1,3 +1,6 @@
+import type { AutoscalingConfig, AutoscalingMetrics, VirtualReplica } from "./autoscaling/AutoscalingTypes";
+import { DEFAULT_AUTOSCALING_CONFIG } from "./autoscaling/AutoscalingTypes";
+
 export type SimulationStatus = 
   | "idle"
   | "ready"
@@ -34,6 +37,7 @@ export type SimulationEventCategory =
   | "routing"
   | "failure"
   | "recovery"
+  | "autoscaling"
   | "metrics";
 
 export type SimulationEventSeverity = "INFO" | "SUCCESS" | "WARNING" | "ERROR";
@@ -112,6 +116,7 @@ export interface SimulationConfig {
   routingAlgorithm: RoutingAlgorithmType;
   failFastOnError: boolean;
   seed?: number;
+  autoscaling: AutoscalingConfig;
 }
 
 export const DEFAULT_SIMULATION_CONFIG: SimulationConfig = {
@@ -119,7 +124,8 @@ export const DEFAULT_SIMULATION_CONFIG: SimulationConfig = {
   requestIntervalTicks: 2,
   processingTicksPerRequest: 3,
   routingAlgorithm: "round_robin",
-  failFastOnError: false
+  failFastOnError: false,
+  autoscaling: DEFAULT_AUTOSCALING_CONFIG
 };
 
 export interface SimulationSnapshot {
@@ -128,9 +134,11 @@ export interface SimulationSnapshot {
   currentStageIndex: number;
   totalStages: number;
   resources: Record<string, ResourceRuntimeInfo>;
+  virtualReplicas?: Record<string, VirtualReplica>;
   requests: SimulatedRequest[];
   events: SimulationEvent[];
   metrics: SimulationMetrics;
+  autoscaling?: AutoscalingMetrics;
   activeEdgeIds: string[];
   activeRequestPaths: string[][];
   config: SimulationConfig;

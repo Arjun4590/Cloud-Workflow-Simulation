@@ -34,14 +34,16 @@ CloudLens acts as an educational cloud laboratory:
 | **Deterministic Simulation Engine**| Implemented | Pure TypeScript virtual clock engine independent of React rendering |
 | **Round Robin Routing** | Implemented | Deterministic rotation with wrap-around, health filtering, and explanatory audit logs |
 | **Least Connections Routing** | Implemented | Load-aware routing tracking active in-flight requests with deterministic tie-breaking |
+| **Autoscaling Simulation Mode** | Implemented | Configurable horizontal elasticity, scale-out/in policy, cooldowns, and draining |
+| **Runtime Replica Registry** | Implemented | Dynamic eligible candidate discovery for virtual replicas without mutating design project |
 | **Event Timeline & Inspector** | Implemented | Categorized event stream with severity filtering and click-to-highlight node on canvas |
 | **Live Metrics Dashboard** | Implemented | Real-time calculation of success/failure rate, latency, and per-backend distribution |
 | **Fault Injection & Recovery** | Implemented | Live node crashing, in-flight request termination, automatic bypass, and revival |
-| **Pre-built Demo Scenarios** | Implemented | One-click scenario loading for Scenarios A through E |
+| **Pre-built Demo Scenarios** | Implemented | One-click scenario loading for Scenarios A through I |
 | **Local-First & Zero Paid Cloud** | Verified | Runs 100% locally in browser; no AWS/GCP bills or external backend server required |
 
 ### Simulation Assumptions & Boundaries
-CloudLens is an educational conceptual model. Simulated virtual ticks, latency, and throughput values are derived from explicit deterministic models rather than proprietary hypervisor or hardware telemetry.
+CloudLens is an educational conceptual model. Simulated virtual ticks, latency, and throughput values are derived from explicit deterministic models rather than proprietary hypervisor or hardware telemetry. Autoscaling utilization is defined explicitly as simulated concurrent-request utilization (`activeRequests / healthyCapacity * 100`).
 
 ---
 
@@ -64,11 +66,13 @@ CloudLens adheres to strict separation of concerns:
 │  - Cycle Detection (DFS)      ││   - Event Stream      │
 └───────────────────────────────┘└───────▲───────────────┘
                                          │
-                                ┌────────┴───────────────┐
-                                │   Routing Algorithms   │
-                                │   - RoundRobin.ts      │
-                                │   - LeastConnections.ts│
-                                └────────────────────────┘
+                        ┌────────────────┴───────────────┐
+                        │                                │
+            ┌───────────▼────────────┐       ┌───────────▼────────────┐
+            │   Routing Algorithms   │       │   Autoscaling Engine   │
+            │   - RoundRobin.ts      │       │   - Replica Registry   │
+            │   - LeastConnections.ts│       │   - AutoscalingPolicy  │
+            └────────────────────────┘       └────────────────────────┘
 ```
 
 ### Module Responsibilities
@@ -77,10 +81,61 @@ CloudLens adheres to strict separation of concerns:
 - `src/engines/validation/ValidationEngine.ts`: Real-time semantic validation engine.
 - `src/engines/workflow/WorkflowEngine.ts`: Dependency analyzer and Kahn's algorithm execution stage calculator.
 - `src/engines/simulation/SimulationEngine.ts`: Pure TypeScript simulation engine tracking ticks, stages, requests, and metrics.
+- `src/engines/simulation/autoscaling/`: Autoscaling Engine, deterministic policy evaluation, lifecycle states (`provisioning`, `ready`, `draining`, `terminated`), and replica registry.
 - `src/engines/simulation/algorithms/`: Implementations of load-balancing algorithms (`RoundRobin`, `LeastConnections`).
 - `src/store/workflowStore.ts`: Design-time state management, undo/redo history, and persistence.
-- `src/store/simulationStore.ts`: Runtime simulation state, playback timer, and fault injection triggers.
-- `src/config/demoScenarios.ts`: Reproducible demonstration architectures (Scenarios A through E).
+- `src/store/simulationStore.ts`: Runtime simulation state, playback timer, fault injection triggers, and autoscaling actions.
+- `src/config/demoScenarios.ts`: Reproducible demonstration architectures (Scenarios A through I).
+
+---
+
+## 4. Autoscaling Policy & Mathematical Model
+
+### Modeled Concurrent-Request Utilization Formula
+Modeled utilization is calculated deterministically during simulation clock ticks:
+
+$$\text{Healthy Capacity} = \sum_{r \in \text{Ready Healthy Replicas}} \text{modeledCapacity}(r)$$
+
+$$\text{Modeled Utilization (\%)} = \left( \frac{\text{Total Active In-Flight Requests}}{\text{Healthy Capacity}} \right) \times 100$$
+
+- If $\text{Healthy Capacity} = 0$, utilization defaults to $100\%$ to trigger emergency provisioning if replicas $< \text{maxReplicas}$.
+
+### Scale-Out Policy
+$$\text{Trigger Scale-Out if: } U \ge \text{threshold}_{\text{out}} \land (\text{tick} - \text{lastScaleOut} \ge \text{cooldown}_{\text{out}}) \land R < R_{\max}$$
+- When triggered, provisions $+1$ virtual replica.
+- Replicas transition through `provisioning` for configured startup delay ticks before entering `ready`.
+
+### Scale-In & Graceful Draining Policy
+$$\text{Trigger Scale-In if: } U \le \text{threshold}_{\text{in}} \land (\text{tick} - \text{lastScaleIn} \ge \text{cooldown}_{\text{in}}) \land R > R_{\min}$$
+- To prevent oscillation, a hysteresis gap ($\text{threshold}_{\text{out}} - \text{threshold}_{\text{in}} \ge 40\%$) is enforced.
+- Selected victim replicas enter `draining` state: load balancers stop assigning new requests to draining replicas while existing in-flight requests complete normally before termination. Zero requests are lost.
+
+---
+
+## 5. Demonstration Scenarios (A through I)
+
+- **Scenario A**: Sequential Container Workflow (Kahn's topological staging)
+- **Scenario B**: Independent Microservices (Parallel staging)
+- **Scenario C**: High-Availability Load Balancer (Round Robin vs Least Connections)
+- **Scenario D**: Fault Tolerance & Failure Injection (Node crashing, request interruption, recovery)
+- **Scenario E**: Invalid Dependency Cycle Rejection (Kahn's cycle detection)
+- **Scenario F**: Autoscaling under Increasing Workload (Dynamic scale-out from 2 to 4+ replicas under load)
+- **Scenario G**: Autoscaling under Decreasing Workload (Low load triggers graceful scale-in and draining to minReplicas)
+- **Scenario H**: Autoscaling with Backend Failure (Node crash drops capacity, triggering automatic replacement provisioning)
+- **Scenario I**: Fixed Capacity Baseline (Same workload as F with autoscaling disabled to observe saturation)
+
+---
+
+## 6. Installation & Verification
+
+```bash
+cd frontend
+npm install
+npm test          # 41 passed across 4 test suites
+npm run lint      # oxlint: 0 warnings, 0 errors
+npm run build     # tsc -b && vite build: 0 errors
+npm run dev       # Start local visualizer at http://localhost:5173
+```
 
 ---
 
@@ -149,6 +204,22 @@ CloudLens includes 5 pre-configured demonstration scenarios selectable directly 
 - **Topology**: Circular loop (`Image A → Container B → Pod C → Image A`).
 - **Educational Concept**: Proves that the Validation Engine and Kahn's algorithm identify circular logic and safely block execution.
 
+### Scenario F — Autoscaling under Increasing Workload
+- **Topology**: Elastic load-balanced cluster (`Client → Ingress-ALB → Workers → Shared-Postgres`).
+- **Educational Concept**: Demonstrates dynamic scale-out from 2 to 4+ replicas as concurrent request load exceeds 70%.
+
+### Scenario G — Autoscaling under Decreasing Workload
+- **Topology**: Elastic load-balanced cluster starting with 4 replicas.
+- **Educational Concept**: Demonstrates graceful scale-in and draining as request arrival rate drops, terminating down to minimum capacity (2) without losing in-flight requests.
+
+### Scenario H — Autoscaling with Backend Failure
+- **Topology**: Load-balanced cluster with failure injection.
+- **Educational Concept**: Crashing a worker drops healthy capacity, raising utilization and triggering the autoscaler to provision replacement capacity.
+
+### Scenario I — Fixed Capacity Baseline
+- **Topology**: Identical high-burst workload as Scenario F with autoscaling disabled.
+- **Educational Concept**: Demonstrates queue saturation, elevated utilization, and lack of dynamic relief in fixed-capacity architectures.
+
 ---
 
 ## 6. Installation & Local Execution
@@ -173,7 +244,7 @@ CloudLens includes 5 pre-configured demonstration scenarios selectable directly 
 4. Open `http://localhost:5173/` in your browser.
 
 ### Automated Testing
-Run the complete Vitest test suite:
+Run the complete Vitest test suite (41 tests across 4 suites):
 ```bash
 npm test
 ```
@@ -182,23 +253,24 @@ To run tests in watch mode:
 npm run test:watch
 ```
 
-### Production Build
-Verify TypeScript compilation and production bundling:
+### Static Analysis & Production Build
 ```bash
-npm run build
+npm run lint      # oxlint: 0 warnings, 0 errors
+npm run build     # tsc -b && vite build: 0 errors
 ```
 
 ---
 
-## 7. Research Evaluation & Next Steps
+## 7. Research Evaluation & Viva Presentation
 
 ### Evaluation Framework
 For academic evaluation, student understanding can be compared across two groups:
 1. **Control Group**: Evaluates cloud architecture diagrams using static documentation.
-2. **Experimental Group**: Explores architectures, injects faults, and inspects routing decisions using CloudLens.
-Metrics: Time to identify bottlenecks, diagnostic accuracy during node outages, and comprehension of load balancing algorithms.
+2. **Experimental Group**: Explores architectures, injects faults, toggles autoscaling, and inspects routing decisions using CloudLens.
+Metrics: Time to identify bottlenecks, diagnostic accuracy during node outages, and comprehension of load balancing and elasticity algorithms.
 
-### Planned Extensions
-- Weighted Round Robin and IP Hash routing algorithms.
-- Stochastic latency variance models with configurable random seeds.
-- Simulated horizontal pod autoscaler (HPA) triggering replica scaling under load.
+### Next Milestone Enhancements
+- Predictive autoscaling models (ARIMA / Holt-Winters forecasting).
+- Multi-region geo-distributed routing and latency-based steering.
+- Stochastic latency jitter distributions with configurable seeds.
+

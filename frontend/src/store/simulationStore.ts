@@ -7,13 +7,16 @@ import type {
   SimulationSnapshot
 } from "../engines/simulation/SimulationTypes";
 import { DEFAULT_SIMULATION_CONFIG } from "../engines/simulation/SimulationTypes";
+import type { AutoscalingConfig } from "../engines/simulation/autoscaling/AutoscalingTypes";
+
+export type AnalysisTab = "validation" | "simulation" | "metrics" | "autoscaling";
 
 interface SimulationStoreState {
   engine: SimulationEngine | null;
   snapshot: SimulationSnapshot | null;
   isPlaying: boolean;
   playbackSpeed: number; // multiplier: 0.5, 1, 2, 5
-  activeTab: "validation" | "simulation" | "metrics";
+  activeTab: AnalysisTab;
   selectedEventId: string | null;
   timerId: number | null;
 
@@ -25,9 +28,11 @@ interface SimulationStoreState {
   reset: () => void;
   setSpeed: (speed: number) => void;
   setAlgorithm: (algorithm: RoutingAlgorithmType) => void;
+  toggleAutoscaling: () => void;
+  setAutoscalingConfig: (config: Partial<AutoscalingConfig>) => void;
   injectFailure: (resourceId: string, reason?: string) => void;
   recoverResource: (resourceId: string) => void;
-  setActiveTab: (tab: "validation" | "simulation" | "metrics") => void;
+  setActiveTab: (tab: AnalysisTab) => void;
   selectEvent: (eventId: string | null) => void;
 }
 
@@ -155,6 +160,33 @@ export const useSimulationStore = create<SimulationStoreState>((set, get) => ({
       engine.setAlgorithm(algorithm);
       set({ snapshot: engine.getSnapshot() });
     }
+  },
+
+  toggleAutoscaling: () => {
+    const { engine, snapshot } = get();
+    if (!engine || !snapshot) return;
+
+    const currentEnabled = snapshot.config.autoscaling.enabled;
+    const newAutoscaling = {
+      ...snapshot.config.autoscaling,
+      enabled: !currentEnabled
+    };
+
+    engine.setConfig({ autoscaling: newAutoscaling });
+    set({ snapshot: engine.getSnapshot() });
+  },
+
+  setAutoscalingConfig: (configUpdates: Partial<AutoscalingConfig>) => {
+    const { engine, snapshot } = get();
+    if (!engine || !snapshot) return;
+
+    const newAutoscaling = {
+      ...snapshot.config.autoscaling,
+      ...configUpdates
+    };
+
+    engine.setConfig({ autoscaling: newAutoscaling });
+    set({ snapshot: engine.getSnapshot() });
   },
 
   injectFailure: (resourceId: string, reason?: string) => {

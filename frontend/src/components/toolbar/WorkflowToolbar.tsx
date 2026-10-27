@@ -3,10 +3,11 @@ import { useWorkflowStore } from "../../store/workflowStore";
 import { useSimulationStore } from "../../store/simulationStore";
 import { DEMO_SCENARIOS } from "../../config/demoScenarios";
 import type { RoutingAlgorithmType } from "../../engines/simulation/SimulationTypes";
+import AutoscalingSettingsModal from "../modals/AutoscalingSettingsModal";
 import { 
   Save, Undo, Redo, Trash2, CheckCircle2, 
   Play, Pause, StepForward, RotateCcw, 
-  Activity
+  Activity, Sliders, TrendingUp
 } from "lucide-react";
 
 export default function WorkflowToolbar() {
@@ -36,12 +37,14 @@ export default function WorkflowToolbar() {
     reset,
     setSpeed,
     setAlgorithm,
+    toggleAutoscaling,
     injectFailure,
     recoverResource,
     setActiveTab
   } = useSimulationStore();
 
   const [selectedDemoId, setSelectedDemoId] = useState<string>("");
+  const [isAutoscalingSettingsOpen, setIsAutoscalingSettingsOpen] = useState<boolean>(false);
 
   // Auto initialize or re-initialize simulation when project structure changes
   useEffect(() => {
@@ -71,8 +74,8 @@ export default function WorkflowToolbar() {
     const demo = DEMO_SCENARIOS.find(d => d.id === demoId);
     if (demo) {
       loadDemoScenario(demo.project, demo.positions);
-      initSimulation(demo.project);
-      setActiveTab("simulation");
+      initSimulation(demo.project, demo.simulationConfig);
+      setActiveTab(demo.simulationConfig?.autoscaling?.enabled ? "autoscaling" : "simulation");
     }
   };
 
@@ -81,21 +84,21 @@ export default function WorkflowToolbar() {
       pause();
     } else {
       if (!snapshot || snapshot.status === "idle" || snapshot.status === "completed" || snapshot.status === "failed") {
-        initSimulation(project);
+        initSimulation(project, snapshot?.config);
       }
       start();
       setAnalysisPanelOpen(true);
-      setActiveTab("simulation");
+      setActiveTab(snapshot?.config.autoscaling.enabled ? "autoscaling" : "simulation");
     }
   };
 
   const handleStep = () => {
     if (!snapshot || snapshot.status === "idle") {
-      initSimulation(project);
+      initSimulation(project, snapshot?.config);
     }
     step();
     setAnalysisPanelOpen(true);
-    setActiveTab("simulation");
+    setActiveTab(snapshot?.config.autoscaling.enabled ? "autoscaling" : "simulation");
   };
 
   const handleAlgorithmChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
@@ -123,10 +126,13 @@ export default function WorkflowToolbar() {
   };
 
   const isSimulationCompleted = snapshot?.status === "completed";
+  const isAutoscaleEnabled = snapshot?.config.autoscaling.enabled ?? false;
+  const currentReplicas = snapshot?.autoscaling?.currentReadyReplicas ?? snapshot?.config.autoscaling.minReplicas ?? 2;
+  const maxReplicas = snapshot?.config.autoscaling.maxReplicas ?? 5;
 
   return (
-    <div className="h-16 border-b border-slate-200 bg-white flex items-center justify-between px-4 shadow-sm z-20 gap-3">
-      {/* Left: Project title & Demo Scenarios */}
+    <div className="h-14 border-b border-slate-200 bg-white px-4 flex items-center justify-between shadow-xs select-none relative z-20">
+      {/* Left: Project Branding & Scenario Selection */}
       <div className="flex items-center space-x-3 min-w-[280px]">
         <input 
           type="text" 
@@ -174,8 +180,41 @@ export default function WorkflowToolbar() {
         </button>
       </div>
 
-      {/* Right: Simulation Controls Bar */}
+      {/* Right: Simulation & Autoscaling Controls Bar */}
       <div className="flex items-center space-x-2">
+        {/* Autoscaling Mode Control */}
+        <div className="flex items-center bg-slate-100 border border-slate-200 rounded-md p-0.5 text-xs">
+          <button
+            id="btn-toggle-autoscaling"
+            onClick={toggleAutoscaling}
+            className={`flex items-center space-x-1 px-2 py-1 rounded font-semibold transition-colors ${
+              isAutoscaleEnabled
+                ? 'bg-indigo-600 text-white shadow-xs'
+                : 'text-slate-600 hover:text-slate-900 hover:bg-slate-200/60'
+            }`}
+            title={isAutoscaleEnabled ? "Autoscaling is ENABLED. Click to disable." : "Autoscaling is DISABLED. Click to enable."}
+          >
+            <TrendingUp size={13} className={isAutoscaleEnabled ? "animate-pulse" : ""} />
+            <span>Autoscale</span>
+            {isAutoscaleEnabled ? (
+              <span className="bg-indigo-800 text-white text-[9px] px-1 py-0.2 rounded font-mono font-bold">
+                {currentReplicas}/{maxReplicas}
+              </span>
+            ) : (
+              <span className="text-[10px] text-slate-400 font-normal">Off</span>
+            )}
+          </button>
+
+          <button
+            id="btn-autoscaling-settings"
+            onClick={() => setIsAutoscalingSettingsOpen(true)}
+            className="p-1 text-slate-500 hover:text-indigo-600 hover:bg-slate-200/60 rounded ml-0.5 transition-colors"
+            title="Configure Autoscaling Thresholds & Cooldowns"
+          >
+            <Sliders size={13} />
+          </button>
+        </div>
+
         {/* Routing Algorithm Selector */}
         <div className="flex items-center space-x-1 bg-slate-100 px-2 py-1 rounded-md text-xs">
           <span className="text-slate-500 font-medium hidden sm:inline">Algo:</span>
@@ -289,7 +328,7 @@ export default function WorkflowToolbar() {
           }`}
           onClick={() => {
             setAnalysisPanelOpen(true);
-            setActiveTab("simulation");
+            setActiveTab(isAutoscaleEnabled ? "autoscaling" : "simulation");
           }}
           title="Open Simulation Events and Metrics Dashboard"
         >
@@ -302,6 +341,12 @@ export default function WorkflowToolbar() {
           )}
         </button>
       </div>
+
+      {/* Modal for Autoscaling Configuration */}
+      <AutoscalingSettingsModal
+        isOpen={isAutoscalingSettingsOpen}
+        onClose={() => setIsAutoscalingSettingsOpen(false)}
+      />
     </div>
   );
 }

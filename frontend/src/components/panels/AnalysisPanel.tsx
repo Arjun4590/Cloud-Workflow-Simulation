@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { 
   X, CheckCircle, AlertTriangle, XCircle, Info, PlayCircle, 
-  Activity, Zap, Filter, HelpCircle
+  Activity, Zap, Filter, HelpCircle, TrendingUp, Cpu, Clock
 } from "lucide-react";
 import { useWorkflowStore } from "../../store/workflowStore";
 import { useSimulationStore } from "../../store/simulationStore";
@@ -30,6 +30,11 @@ export default function AnalysisPanel() {
 
   const events = snapshot?.events || [];
   const metrics = snapshot?.metrics;
+  const autoscaling = snapshot?.autoscaling;
+  const autoscaleConfig = snapshot?.config.autoscaling;
+  const virtualReplicas = snapshot?.virtualReplicas || {};
+  const isAutoscaleEnabled = autoscaleConfig?.enabled ?? false;
+
   const filteredEvents = severityFilter === "ALL" 
     ? events 
     : events.filter(e => e.severity === severityFilter);
@@ -54,11 +59,11 @@ export default function AnalysisPanel() {
       </div>
 
       {/* Tabs */}
-      <div className="flex border-b border-slate-200 bg-slate-100 text-xs font-semibold">
+      <div className="flex border-b border-slate-200 bg-slate-100 text-xs font-semibold overflow-x-auto">
         <button
           id="tab-btn-validation"
           onClick={() => setActiveTab("validation")}
-          className={`flex-1 py-2.5 px-3 flex items-center justify-center gap-1.5 transition-colors border-b-2 ${
+          className={`py-2 px-2.5 flex items-center justify-center gap-1 transition-colors border-b-2 flex-1 whitespace-nowrap ${
             activeTab === "validation"
               ? "border-blue-600 bg-white text-blue-700 shadow-sm"
               : "border-transparent text-slate-600 hover:text-slate-800 hover:bg-slate-200/60"
@@ -66,26 +71,26 @@ export default function AnalysisPanel() {
         >
           <span>Validation</span>
           {validationErrorsCount > 0 ? (
-            <span className="bg-red-500 text-white text-[10px] px-1.5 py-0.2 rounded-full font-bold">
+            <span className="bg-red-500 text-white text-[10px] px-1 py-0.2 rounded-full font-bold">
               {validationErrorsCount}
             </span>
           ) : (
-            <CheckCircle size={12} className="text-emerald-500" />
+            <CheckCircle size={11} className="text-emerald-500" />
           )}
         </button>
 
         <button
           id="tab-btn-simulation"
           onClick={() => setActiveTab("simulation")}
-          className={`flex-1 py-2.5 px-3 flex items-center justify-center gap-1.5 transition-colors border-b-2 ${
+          className={`py-2 px-2.5 flex items-center justify-center gap-1 transition-colors border-b-2 flex-1 whitespace-nowrap ${
             activeTab === "simulation"
               ? "border-blue-600 bg-white text-blue-700 shadow-sm"
               : "border-transparent text-slate-600 hover:text-slate-800 hover:bg-slate-200/60"
           }`}
         >
-          <span>Event Timeline</span>
+          <span>Events</span>
           {events.length > 0 && (
-            <span className="bg-indigo-600 text-white text-[10px] px-1.5 py-0.2 rounded-full font-bold">
+            <span className="bg-indigo-600 text-white text-[10px] px-1 py-0.2 rounded-full font-bold">
               {events.length}
             </span>
           )}
@@ -94,13 +99,29 @@ export default function AnalysisPanel() {
         <button
           id="tab-btn-metrics"
           onClick={() => setActiveTab("metrics")}
-          className={`flex-1 py-2.5 px-3 flex items-center justify-center gap-1.5 transition-colors border-b-2 ${
+          className={`py-2 px-2.5 flex items-center justify-center gap-1 transition-colors border-b-2 flex-1 whitespace-nowrap ${
             activeTab === "metrics"
               ? "border-blue-600 bg-white text-blue-700 shadow-sm"
               : "border-transparent text-slate-600 hover:text-slate-800 hover:bg-slate-200/60"
           }`}
         >
-          <span>Metrics & Decisions</span>
+          <span>Metrics</span>
+        </button>
+
+        <button
+          id="tab-btn-autoscaling"
+          onClick={() => setActiveTab("autoscaling")}
+          className={`py-2 px-2.5 flex items-center justify-center gap-1 transition-colors border-b-2 flex-1 whitespace-nowrap ${
+            activeTab === "autoscaling"
+              ? "border-indigo-600 bg-white text-indigo-700 shadow-sm font-bold"
+              : "border-transparent text-slate-600 hover:text-slate-800 hover:bg-slate-200/60"
+          }`}
+        >
+          <TrendingUp size={12} className={isAutoscaleEnabled ? "text-indigo-600" : ""} />
+          <span>Autoscale</span>
+          {isAutoscaleEnabled && (
+            <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse"></span>
+          )}
         </button>
       </div>
 
@@ -424,14 +445,13 @@ export default function AnalysisPanel() {
                   <div className="font-semibold mb-1 text-slate-700">Target Candidate Load Snapshot:</div>
                   <div className="grid grid-cols-2 gap-1 font-mono text-[10px]">
                     {Object.entries(snapshot.lastRoutingDecision.targetActiveConnections).map(([cId, count]) => {
-                      const res = project.resources.find(r => r.id === cId);
                       const isChosen = cId === snapshot.lastRoutingDecision?.selectedTargetId;
                       return (
                         <div 
                           key={cId} 
                           className={`p-1 rounded ${isChosen ? 'bg-blue-200/60 font-bold text-blue-900' : 'bg-white/80'}`}
                         >
-                          {res?.configuration?.name || cId}: {count} in-flight
+                          {cId}: {count} in-flight
                         </div>
                       );
                     })}
@@ -459,6 +479,252 @@ export default function AnalysisPanel() {
               </p>
             </div>
           </div>
+        </div>
+      )}
+
+      {/* Tab 4: Autoscaling & Dynamic Capacity Elasticity */}
+      {activeTab === "autoscaling" && (
+        <div className="p-4 flex-1 overflow-y-auto space-y-4">
+          {/* Status Header */}
+          <div className="p-3 bg-slate-50 border border-slate-200 rounded-lg space-y-2">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-1.5 font-bold text-xs text-slate-800">
+                <Cpu size={15} className="text-indigo-600" />
+                <span>Simulation Autoscaling</span>
+              </div>
+              <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${
+                isAutoscaleEnabled
+                  ? "bg-emerald-100 text-emerald-800 border border-emerald-300"
+                  : "bg-slate-200 text-slate-700"
+              }`}>
+                {isAutoscaleEnabled ? "ACTIVE (ELASTIC)" : "DISABLED (FIXED)"}
+              </span>
+            </div>
+
+            <div className="grid grid-cols-3 gap-1.5 text-[10px] text-slate-500 pt-1 border-t border-slate-200 font-mono">
+              <div>Min: <strong className="text-slate-700">{autoscaleConfig?.minReplicas ?? 2}</strong></div>
+              <div>Max: <strong className="text-slate-700">{autoscaleConfig?.maxReplicas ?? 5}</strong></div>
+              <div>Cap: <strong className="text-slate-700">{autoscaleConfig?.modeledCapacityPerReplica ?? 3}/rep</strong></div>
+            </div>
+          </div>
+
+          {/* Modeled Utilization Meter */}
+          <div className="p-3 bg-white border border-slate-200 rounded-lg shadow-xs space-y-2">
+            <div className="flex items-center justify-between">
+              <div>
+                <span className="text-xs font-bold text-slate-700">Modeled Concurrent Utilization</span>
+                <p className="text-[10px] text-slate-400">Simulated active request load vs ready capacity</p>
+              </div>
+              <div className="text-right">
+                <span className={`text-xl font-extrabold font-mono ${
+                  (autoscaling?.currentModeledUtilization ?? 0) >= (autoscaleConfig?.scaleOutThreshold ?? 75)
+                    ? "text-red-600"
+                    : (autoscaling?.currentModeledUtilization ?? 0) <= (autoscaleConfig?.scaleInThreshold ?? 30)
+                      ? "text-blue-600"
+                      : "text-emerald-600"
+                }`}>
+                  {autoscaling ? `${autoscaling.currentModeledUtilization.toFixed(1)}%` : "0.0%"}
+                </span>
+              </div>
+            </div>
+
+            {/* Threshold Meter Bar */}
+            <div className="relative pt-1 pb-3">
+              <div className="w-full bg-slate-100 rounded-full h-3 border border-slate-200 overflow-hidden relative">
+                <div
+                  className={`h-full rounded-full transition-all duration-300 ${
+                    (autoscaling?.currentModeledUtilization ?? 0) >= (autoscaleConfig?.scaleOutThreshold ?? 75)
+                      ? "bg-red-500"
+                      : (autoscaling?.currentModeledUtilization ?? 0) <= (autoscaleConfig?.scaleInThreshold ?? 30)
+                        ? "bg-blue-500"
+                        : "bg-emerald-500"
+                  }`}
+                  style={{ width: `${Math.min(100, Math.max(0, autoscaling?.currentModeledUtilization ?? 0))}%` }}
+                ></div>
+              </div>
+
+              {/* Threshold indicator markers */}
+              {autoscaleConfig && (
+                <>
+                  <div
+                    className="absolute top-0 bottom-0 w-0.5 bg-blue-600 z-10"
+                    style={{ left: `${autoscaleConfig.scaleInThreshold}%` }}
+                    title={`Scale-In Threshold: ${autoscaleConfig.scaleInThreshold}%`}
+                  >
+                    <span className="absolute -bottom-3 -translate-x-1/2 text-[9px] font-bold text-blue-600 font-mono">
+                      In:{autoscaleConfig.scaleInThreshold}%
+                    </span>
+                  </div>
+
+                  <div
+                    className="absolute top-0 bottom-0 w-0.5 bg-red-600 z-10"
+                    style={{ left: `${autoscaleConfig.scaleOutThreshold}%` }}
+                    title={`Scale-Out Threshold: ${autoscaleConfig.scaleOutThreshold}%`}
+                  >
+                    <span className="absolute -bottom-3 -translate-x-1/2 text-[9px] font-bold text-red-600 font-mono">
+                      Out:{autoscaleConfig.scaleOutThreshold}%
+                    </span>
+                  </div>
+                </>
+              )}
+            </div>
+
+            <div className="text-[10px] text-slate-500 font-mono flex justify-between pt-1 border-t border-slate-100">
+              <span>Active: {autoscaling?.currentActiveRequests ?? 0} reqs</span>
+              <span>Healthy Cap: {autoscaling?.currentHealthyCapacity ?? 0}</span>
+              <span>Ready Replicas: {autoscaling?.currentReadyReplicas ?? 0}</span>
+            </div>
+          </div>
+
+          {/* Key Elasticity Metrics Cards */}
+          <div className="grid grid-cols-2 gap-2">
+            <div className="p-2.5 bg-slate-50 border border-slate-200 rounded-md">
+              <div className="text-[10px] text-slate-500 font-semibold uppercase">Scale-Out Events</div>
+              <div className="text-lg font-bold text-indigo-700 mt-0.5 font-mono">
+                {autoscaling?.scaleOutCount ?? 0}
+              </div>
+              <div className="text-[10px] text-slate-400">Total Created: +{autoscaling?.totalCreatedReplicas ?? 0}</div>
+            </div>
+
+            <div className="p-2.5 bg-slate-50 border border-slate-200 rounded-md">
+              <div className="text-[10px] text-slate-500 font-semibold uppercase">Scale-In Events</div>
+              <div className="text-lg font-bold text-purple-700 mt-0.5 font-mono">
+                {autoscaling?.scaleInCount ?? 0}
+              </div>
+              <div className="text-[10px] text-slate-400">Total Removed: -{autoscaling?.totalRemovedReplicas ?? 0}</div>
+            </div>
+          </div>
+
+          {/* Cooldown Status Pill */}
+          {autoscaling && (
+            <div className="flex justify-between items-center px-3 py-2 bg-slate-50 border border-slate-200 rounded-md text-[11px]">
+              <span className="text-slate-600 font-semibold flex items-center gap-1">
+                <Clock size={12} className="text-slate-400" />
+                <span>Cooldowns Remaining:</span>
+              </span>
+              <div className="space-x-2 font-mono text-[10px]">
+                <span className={autoscaling.cooldownRemaining.scaleOut > 0 ? "text-amber-600 font-bold" : "text-slate-400"}>
+                  Out: {autoscaling.cooldownRemaining.scaleOut}t
+                </span>
+                <span className={autoscaling.cooldownRemaining.scaleIn > 0 ? "text-purple-600 font-bold" : "text-slate-400"}>
+                  In: {autoscaling.cooldownRemaining.scaleIn}t
+                </span>
+              </div>
+            </div>
+          )}
+
+          {/* Active Virtual Replicas Table */}
+          <div className="space-y-1.5 pt-1 border-t border-slate-200">
+            <div className="flex justify-between items-center">
+              <span className="text-xs font-bold text-slate-700 uppercase tracking-wider text-[10px]">Virtual Replicas Registry</span>
+              <span className="text-[10px] font-mono text-indigo-600 font-bold">
+                {Object.keys(virtualReplicas).length} total
+              </span>
+            </div>
+
+            {Object.keys(virtualReplicas).length === 0 ? (
+              <div className="text-xs text-slate-400 bg-slate-50 p-3 rounded text-center">
+                No active virtual replicas. Run simulation to initialize replicas.
+              </div>
+            ) : (
+              <div className="space-y-1.5">
+                {Object.values(virtualReplicas).map((rep) => {
+                  let stateBadge = "bg-emerald-100 text-emerald-800 border-emerald-200";
+                  if (rep.isFailed) stateBadge = "bg-red-100 text-red-800 border-red-200";
+                  else if (rep.state === "provisioning") stateBadge = "bg-amber-100 text-amber-800 border-amber-200 animate-pulse";
+                  else if (rep.state === "draining") stateBadge = "bg-purple-100 text-purple-800 border-purple-200";
+
+                  return (
+                    <div key={rep.id} className="p-2 bg-slate-50 border border-slate-200 rounded-md flex justify-between items-center text-xs">
+                      <div className="min-w-0 flex-1">
+                        <div className="font-semibold text-slate-800 truncate" title={rep.name}>
+                          {rep.name}
+                        </div>
+                        <div className="text-[10px] text-slate-400 font-mono">
+                          ID: {rep.id} &bull; Handled: {rep.handledRequests}
+                        </div>
+                      </div>
+                      <div className="flex items-center space-x-2 flex-shrink-0">
+                        <span className="font-mono text-[10px] font-semibold text-slate-600">
+                          {rep.activeRequests}/{rep.modeledCapacity} load
+                        </span>
+                        <span className={`text-[9px] font-bold px-1.5 py-0.2 rounded border uppercase font-mono ${stateBadge}`}>
+                          {rep.isFailed ? "FAILED" : rep.state}
+                        </span>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+
+          {/* Decision Explainability Card */}
+          <div className="space-y-1.5 pt-1 border-t border-slate-200">
+            <span className="text-xs font-bold text-slate-700 uppercase tracking-wider text-[10px]">Latest Scaling Decision Rationale</span>
+            {autoscaling?.lastDecision ? (
+              <div className="p-3 bg-indigo-50/70 border border-indigo-200 rounded-md text-xs space-y-1">
+                <div className="flex justify-between items-center">
+                  <span className={`font-bold px-1.5 py-0.2 rounded text-[10px] font-mono ${
+                    autoscaling.lastDecision.direction === "SCALE_OUT"
+                      ? "bg-indigo-600 text-white"
+                      : autoscaling.lastDecision.direction === "SCALE_IN"
+                        ? "bg-purple-600 text-white"
+                        : "bg-slate-200 text-slate-700"
+                  }`}>
+                    {autoscaling.lastDecision.direction}
+                  </span>
+                  <span className="text-[10px] font-mono text-slate-500">
+                    Target: {autoscaling.lastDecision.targetReplicas} replicas
+                  </span>
+                </div>
+                <p className="text-slate-700 leading-relaxed text-[11px] pt-1">
+                  {autoscaling.lastDecision.reason}
+                </p>
+              </div>
+            ) : (
+              <div className="text-xs text-slate-400 bg-slate-50 p-2.5 rounded text-center">
+                No scaling decisions recorded yet.
+              </div>
+            )}
+          </div>
+
+          {/* Historical Utilization & Capacity Chart */}
+          {autoscaling && autoscaling.history.length > 0 && (
+            <div className="space-y-1.5 pt-1 border-t border-slate-200">
+              <span className="text-xs font-bold text-slate-700 uppercase tracking-wider text-[10px]">Simulation History Chart</span>
+              <div className="bg-slate-50 p-2.5 rounded border border-slate-200 space-y-1 text-xs">
+                <div className="flex justify-between text-[10px] text-slate-500 mb-1">
+                  <span>Tick &bull; Utilization (%)</span>
+                  <span>Ready Replicas</span>
+                </div>
+                <div className="space-y-1 max-h-36 overflow-y-auto pr-1">
+                  {autoscaling.history.slice(-8).reverse().map((h) => {
+                    const isDecisionTick = h.decision !== undefined;
+                    return (
+                      <div key={h.tick} className={`flex items-center justify-between p-1 rounded font-mono text-[10px] ${
+                        isDecisionTick ? "bg-indigo-100 text-indigo-900 font-bold" : "bg-white text-slate-700"
+                      }`}>
+                        <div className="flex items-center space-x-1.5">
+                          <span className="text-slate-400">T:{h.tick}</span>
+                          <span>{h.utilization.toFixed(0)}%</span>
+                          {isDecisionTick && (
+                            <span className="text-[9px] bg-indigo-600 text-white px-1 rounded">
+                              {h.decision?.direction}
+                            </span>
+                          )}
+                        </div>
+                        <div className="flex items-center space-x-1">
+                          <span>{h.readyReplicas} reps</span>
+                          <span className="text-slate-400">({h.activeRequests} reqs)</span>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            </div>
+          )}
         </div>
       )}
     </div>

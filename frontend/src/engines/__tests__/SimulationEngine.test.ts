@@ -179,4 +179,182 @@ describe("SimulationEngine", () => {
     expect(snapA.events.map(e => e.type)).toEqual(snapB.events.map(e => e.type));
     expect(snapA.requests.map(r => r.targetNodeId)).toEqual(snapB.requests.map(r => r.targetNodeId));
   });
+
+  describe("Autoscaling Integration", () => {
+    it("should dynamically scale out when modeled utilization exceeds threshold", () => {
+      const project = createValidHaProject();
+      const engine = new SimulationEngine(project, {
+        totalRequests: 12,
+        requestIntervalTicks: 1,
+        processingTicksPerRequest: 4,
+        routingAlgorithm: "round_robin",
+        autoscaling: {
+          enabled: true,
+          minReplicas: 2,
+          initialReplicas: 2,
+          maxReplicas: 5,
+          scaleOutThreshold: 75,
+          scaleInThreshold: 30,
+          scaleOutCooldown: 2,
+          scaleInCooldown: 4,
+          modeledCapacityPerReplica: 2,
+          startupDelayTicks: 0,
+          scaleOutIncrement: 1,
+          scaleInDecrement: 1
+        }
+      });
+
+      // Step until scale out is triggered
+      for (let i = 0; i < 6; i++) {
+        engine.step();
+      }
+
+      const snap = engine.getSnapshot();
+      expect(snap.autoscaling).toBeDefined();
+      expect(snap.autoscaling?.scaleOutCount).toBeGreaterThan(0);
+      expect(snap.autoscaling?.currentTotalReplicas).toBeGreaterThan(2);
+      expect(snap.events.some(e => e.type === "SCALE_OUT_TRIGGERED")).toBe(true);
+
+      // Check that virtual replicas exist and are routable
+      const virtualReps = Object.values(snap.virtualReplicas || {});
+      expect(virtualReps.length).toBeGreaterThan(2);
+      expect(virtualReps.some(r => r.id.includes("-rep-"))).toBe(true);
+    });
+
+    it("should route traffic to newly ready virtual replicas", () => {
+      const project = createValidHaProject();
+      const engine = new SimulationEngine(project, {
+        totalRequests: 16,
+        requestIntervalTicks: 1,
+        processingTicksPerRequest: 4,
+        routingAlgorithm: "least_connections",
+        autoscaling: {
+          enabled: true,
+          minReplicas: 2,
+          initialReplicas: 2,
+          maxReplicas: 4,
+          scaleOutThreshold: 60,
+          scaleInThreshold: 20,
+          scaleOutCooldown: 1,
+          scaleInCooldown: 4,
+          modeledCapacityPerReplica: 2,
+          startupDelayTicks: 0,
+          scaleOutIncrement: 1,
+          scaleInDecrement: 1
+        }
+      });
+
+      // Run 10 ticks
+      for (let i = 0; i < 10; i++) {
+        engine.step();
+      }
+
+      const snap = engine.getSnapshot();
+      // At least one request should have targeted a virtual replica (id with -rep-)
+      const routedToVirtual = snap.requests.some(r => r.targetNodeId?.includes("-rep-"));
+      expect(routedToVirtual).toBe(true);
+    });
+
+    it("should gracefully drain and remove replicas during scale-in", () => {
+      const project = createValidHaProject();
+      const engine = new SimulationEngine(project, {
+        totalRequests: 4, // short workload
+        requestIntervalTicks: 4, // slow arrival
+        processingTicksPerRequest: 1,
+        autoscaling: {
+          enabled: true,
+          minReplicas: 2,
+          initialReplicas: 4, // starts with 4 replicas
+          maxReplicas: 5,
+          scaleOutThreshold: 80,
+          scaleInThreshold: 35,
+          scaleOutCooldown: 2,
+          scaleInCooldown: 2,
+          modeledCapacityPerReplica: 4,
+          startupDelayTicks: 0,
+          scaleOutIncrement: 1,
+          scaleInDecrement: 1
+        }
+      });
+
+      // Step multiple times under low load
+      for (let i = 0; i < 10; i++) {
+        engine.step();
+      }
+
+      const snap = engine.getSnapshot();
+      expect(snap.autoscaling?.scaleInCount).toBeGreaterThan(0);
+      expect(snap.autoscaling?.currentTotalReplicas).toBeLessThan(4);
+      expect(snap.autoscaling?.currentTotalReplicas).toBeGreaterThanOrEqual(2);
+      expect(snap.events.some(e => e.type === "SCALE_IN_TRIGGERED")).toBe(true);
+    });
+
+    it("should preserve fixed capacity when autoscaling is disabled", () => {
+      const project = createValidHaProject();
+      const engine = new SimulationEngine(project, {
+        totalRequests: 16,
+        requestIntervalTicks: 1,
+        processingTicksPerRequest: 5,
+        autoscaling: {
+          enabled: false, // DISABLED
+          minReplicas: 2,
+          initialReplicas: 2,
+          maxReplicas: 5,
+          scaleOutThreshold: 50,
+          scaleInThreshold: 20,
+          scaleOutCooldown: 1,
+          scaleInCooldown: 2,
+          modeledCapacityPerReplica: 2,
+          startupDelayTicks: 0,
+          scaleOutIncrement: 1,
+          scaleInDecrement: 1
+        }
+      });
+
+      for (let i = 0; i < 10; i++) {
+        engine.step();
+      }
+
+      const snap = engine.getSnapshot();
+      expect(snap.autoscaling?.scaleOutCount).toBe(0);
+      expect(snap.autoscaling?.currentTotalReplicas).toBe(2);
+      expect(snap.events.some(e => e.type === "SCALE_OUT_TRIGGERED")).toBe(false);
+    });
+
+    it("should reset completely without mutating project snapshot or leaking replicas", () => {
+      const project = createValidHaProject();
+      const initialResourcesCount = project.resources.length;
+
+      const engine = new SimulationEngine(project, {
+        totalRequests: 10,
+        requestIntervalTicks: 1,
+        processingTicksPerRequest: 4,
+        autoscaling: {
+          enabled: true,
+          minReplicas: 2,
+          initialReplicas: 2,
+          maxReplicas: 5,
+          scaleOutThreshold: 60,
+          scaleInThreshold: 20,
+          scaleOutCooldown: 1,
+          scaleInCooldown: 2,
+          modeledCapacityPerReplica: 2,
+          startupDelayTicks: 0,
+          scaleOutIncrement: 1,
+          scaleInDecrement: 1
+        }
+      });
+
+      for (let i = 0; i < 6; i++) engine.step();
+      expect(engine.getSnapshot().autoscaling?.scaleOutCount).toBeGreaterThan(0);
+
+      // Reset
+      const snap = engine.reset();
+      expect(snap.currentTick).toBe(0);
+      expect(snap.autoscaling?.currentTotalReplicas).toBe(2);
+      expect(snap.autoscaling?.scaleOutCount).toBe(0);
+      expect(snap.autoscaling?.scaleInCount).toBe(0);
+      expect(project.resources.length).toBe(initialResourcesCount);
+    });
+  });
 });

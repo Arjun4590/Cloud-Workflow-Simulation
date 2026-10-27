@@ -1,4 +1,4 @@
-import type { CloudProject, WorkflowConnection } from "../../types/workflow";
+import type { CloudProject, CloudResource, WorkflowConnection } from "../../types/workflow";
 import type { ExecutionPlan } from "../types";
 import { WorkflowEngine } from "../workflow/WorkflowEngine";
 import type {
@@ -15,6 +15,9 @@ import { DEFAULT_SIMULATION_CONFIG } from "./SimulationTypes";
 import type { IRoutingAlgorithm } from "./algorithms/RoutingAlgorithm";
 import { LeastConnectionsAlgorithm } from "./algorithms/LeastConnections";
 import { RoundRobinAlgorithm } from "./algorithms/RoundRobin";
+import type { BaseBackendModel } from "./autoscaling/AutoscalingEngine";
+import { AutoscalingEngine } from "./autoscaling/AutoscalingEngine";
+import type { VirtualReplica } from "./autoscaling/AutoscalingTypes";
 
 export class SimulationEngine {
   private projectSnapshot: CloudProject;
@@ -32,6 +35,8 @@ export class SimulationEngine {
   private roundRobinAlgo: RoundRobinAlgorithm = new RoundRobinAlgorithm();
   private leastConnsAlgo: LeastConnectionsAlgorithm = new LeastConnectionsAlgorithm();
   private currentAlgorithm: IRoutingAlgorithm;
+
+  private autoscalingEngine!: AutoscalingEngine;
 
   private failureCount: number = 0;
   private recoveryCount: number = 0;
@@ -57,7 +62,72 @@ export class SimulationEngine {
   }
 
   /**
-   * Initialize or re-initialize resource states and metrics
+   * Discovers base backend instances participating in load balancing
+   */
+  private discoverBaseBackends(): BaseBackendModel[] {
+    const lbNode = this.projectSnapshot.resources.find(r => r.type === "load_balancer");
+    let backendNodes: CloudResource[] = [];
+
+    if (lbNode) {
+      const targetIds = this.projectSnapshot.connections
+        .filter(c => c.source === lbNode.id && (c.type === "routes_to" || c.type === "dependency"))
+        .map(c => c.target);
+      backendNodes = this.projectSnapshot.resources.filter(r => targetIds.includes(r.id));
+    }
+
+    if (backendNodes.length === 0) {
+      backendNodes = this.projectSnapshot.resources.filter(
+        r => r.type === "backend" || r.type === "service" || r.type === "container" || r.type === "pod"
+      );
+    }
+
+    if (backendNodes.length === 0) {
+      backendNodes = this.projectSnapshot.resources.filter(
+        r => r.type !== "frontend" && r.type !== "api" && r.type !== "load_balancer"
+      );
+    }
+
+    return backendNodes.map(r => {
+      const dbConn = this.projectSnapshot.connections.find(
+        c => c.source === r.id && (c.type === "uses" || c.type === "dependency")
+      );
+      return {
+        id: r.id,
+        name: r.configuration?.name || r.name || r.id,
+        type: r.type,
+        databaseNodeId: dbConn?.target,
+        loadBalancerId: lbNode?.id
+      };
+    });
+  }
+
+  /**
+   * Builds combined runtime states for routing algorithm selection
+   */
+  private getRoutingResourceStates(): Map<string, ResourceRuntimeInfo> {
+    const map = new Map<string, ResourceRuntimeInfo>(this.resourceStates);
+    if (this.autoscalingEngine) {
+      for (const replica of this.autoscalingEngine.getAllReplicas()) {
+        map.set(replica.id, {
+          resourceId: replica.id,
+          name: replica.name,
+          type: "backend",
+          state: replica.state === "ready"
+            ? "ready"
+            : (replica.state === "provisioning" ? "pending" : (replica.state === "draining" ? "running" : "unavailable")),
+          activeRequests: replica.activeRequests,
+          handledRequests: replica.handledRequests,
+          failedRequests: replica.failedRequests,
+          isFailed: replica.isFailed,
+          failureReason: replica.failureReason
+        });
+      }
+    }
+    return map;
+  }
+
+  /**
+   * Initialize or re-initialize resource states, autoscaling, and metrics
    */
   private initializeState(): void {
     this.resourceStates.clear();
@@ -88,6 +158,9 @@ export class SimulationEngine {
       });
     }
 
+    const baseBackends = this.discoverBaseBackends();
+    this.autoscalingEngine = new AutoscalingEngine(baseBackends, this.config.autoscaling);
+
     if (!this.plan.valid) {
       this.status = "failed";
       this.emitEvent({
@@ -109,6 +182,10 @@ export class SimulationEngine {
     return { ...this.config };
   }
 
+  public getAutoscalingEngine(): AutoscalingEngine {
+    return this.autoscalingEngine;
+  }
+
   public setAlgorithm(algo: RoutingAlgorithmType): void {
     this.config.routingAlgorithm = algo;
     this.currentAlgorithm = algo === "least_connections"
@@ -117,9 +194,25 @@ export class SimulationEngine {
   }
 
   public setConfig(config: Partial<SimulationConfig>): void {
+    const prevAutoscalingEnabled = this.config.autoscaling?.enabled;
     this.config = { ...this.config, ...config };
+
     if (config.routingAlgorithm) {
       this.setAlgorithm(config.routingAlgorithm);
+    }
+
+    if (config.autoscaling && this.autoscalingEngine) {
+      this.autoscalingEngine.setConfig(this.config.autoscaling);
+      if (prevAutoscalingEnabled !== undefined && prevAutoscalingEnabled !== this.config.autoscaling.enabled) {
+        this.emitEvent({
+          category: "autoscaling",
+          type: this.config.autoscaling.enabled ? "AUTOSCALING_ENABLED" : "AUTOSCALING_DISABLED",
+          severity: "INFO",
+          message: this.config.autoscaling.enabled
+            ? `Autoscaling enabled: Min=${this.config.autoscaling.minReplicas}, Max=${this.config.autoscaling.maxReplicas}, Scale-Out>=${this.config.autoscaling.scaleOutThreshold}%, Scale-In<=${this.config.autoscaling.scaleInThreshold}%.`
+            : "Autoscaling disabled. System operating in fixed capacity mode."
+        });
+      }
     }
   }
 
@@ -204,11 +297,101 @@ export class SimulationEngine {
     this.activeEdgeIds.clear();
     this.activeRequestPaths = [];
 
+    // Phase 0: Advance virtual replica lifecycle (provisioning -> ready, draining -> terminated)
+    const lifecycleResult = this.autoscalingEngine.advanceLifecycle(this.currentTick);
+    for (const prov of lifecycleResult.provisioned) {
+      this.emitEvent({
+        category: "autoscaling",
+        type: "REPLICA_READY",
+        resourceId: prov.id,
+        severity: "SUCCESS",
+        message: `Replica "${prov.name}" (${prov.id}) finished startup delay and is now READY to receive traffic.`
+      });
+    }
+    for (const term of lifecycleResult.terminated) {
+      this.emitEvent({
+        category: "autoscaling",
+        type: "REPLICA_REMOVED",
+        resourceId: term.id,
+        severity: "INFO",
+        message: `Replica "${term.name}" (${term.id}) finished draining all in-flight requests and was safely TERMINATED.`
+      });
+    }
+
     // Phase 1: Advance infrastructure / dependency execution stages
     this.processExecutionStages();
 
-    // Phase 2: If infrastructure has booted enough, process traffic routing
+    // Phase 2: Process traffic routing
     this.processTrafficRouting();
+
+    // Phase 3: Evaluate Autoscaling policy (if enabled)
+    if (this.config.autoscaling?.enabled) {
+      const scalingResult = this.autoscalingEngine.evaluateAndStep(this.currentTick);
+      const dec = scalingResult.decision;
+
+      if (dec.direction === "SCALE_OUT") {
+        this.emitEvent({
+          category: "autoscaling",
+          type: "SCALE_OUT_TRIGGERED",
+          severity: "INFO",
+          message: `Scale-out triggered: modeled utilization reached ${dec.currentUtilization.toFixed(1)}% (threshold: ${this.config.autoscaling.scaleOutThreshold}%). Scaling from ${dec.currentReplicas} to ${dec.targetReplicas} replicas.`,
+          details: { decision: dec }
+        });
+        for (const newRep of scalingResult.newReplicas) {
+          if (newRep.state === "provisioning") {
+            this.emitEvent({
+              category: "autoscaling",
+              type: "REPLICA_PROVISIONING",
+              resourceId: newRep.id,
+              severity: "INFO",
+              message: `Provisioning virtual replica "${newRep.name}" (will become ready at tick ${newRep.readyTick}).`
+            });
+          } else {
+            this.emitEvent({
+              category: "autoscaling",
+              type: "REPLICA_READY",
+              resourceId: newRep.id,
+              severity: "SUCCESS",
+              message: `Virtual replica "${newRep.name}" provisioned and immediately READY for traffic.`
+            });
+          }
+        }
+      } else if (dec.direction === "SCALE_IN") {
+        this.emitEvent({
+          category: "autoscaling",
+          type: "SCALE_IN_TRIGGERED",
+          severity: "INFO",
+          message: `Scale-in triggered: modeled utilization fell to ${dec.currentUtilization.toFixed(1)}% (threshold: ${this.config.autoscaling.scaleInThreshold}%). Scaling down from ${dec.currentReplicas} to ${dec.targetReplicas} replicas.`,
+          details: { decision: dec }
+        });
+        for (const victim of scalingResult.drainingReplicas) {
+          if (victim.state === "draining") {
+            this.emitEvent({
+              category: "autoscaling",
+              type: "REPLICA_DRAINING",
+              resourceId: victim.id,
+              severity: "WARNING",
+              message: `Replica "${victim.name}" entered DRAINING state (${victim.activeRequests} in-flight request(s) completing).`
+            });
+          } else if (victim.state === "terminated") {
+            this.emitEvent({
+              category: "autoscaling",
+              type: "REPLICA_REMOVED",
+              resourceId: victim.id,
+              severity: "INFO",
+              message: `Replica "${victim.name}" had no active requests and was immediately TERMINATED.`
+            });
+          }
+        }
+      } else if (dec.trigger === "BLOCKED_MAX_CAPACITY" && dec.currentUtilization >= this.config.autoscaling.scaleOutThreshold) {
+        this.emitEvent({
+          category: "autoscaling",
+          type: "SCALING_BLOCKED_MAX_CAPACITY",
+          severity: "WARNING",
+          message: `Scale-out blocked: utilization is ${dec.currentUtilization.toFixed(1)}%, but maximum configured capacity (${this.config.autoscaling.maxReplicas} replicas) has been reached.`
+        });
+      }
+    }
 
     // Check completion condition
     this.checkCompletion();
@@ -323,29 +506,33 @@ export class SimulationEngine {
         : this.getResource(lbConn.source);
     }
 
-    // Find backend candidates connected from load balancer (or from client if no LB)
+    // Backend discovery: prefer dynamic replica registry from AutoscalingEngine
+    const allReplicas = this.autoscalingEngine ? this.autoscalingEngine.getAllReplicas() : [];
     let candidateIds: string[] = [];
-    if (lbNode) {
-      candidateIds = this.projectSnapshot.connections
-        .filter(c => c.source === lbNode!.id && c.type === "routes_to")
-        .map(c => c.target);
 
-      // If no explicit routes_to outgoing from LB, fallback to all backend resources
-      if (candidateIds.length === 0) {
-        candidateIds = this.projectSnapshot.resources
-          .filter(r => r.type === "backend" || r.type === "service" || r.type === "container" || r.type === "pod")
-          .map(r => r.id);
-      }
+    if (allReplicas.length > 0) {
+      candidateIds = this.autoscalingEngine.getEligibleTargetIds();
     } else {
-      // No load balancer: direct routes from client
-      candidateIds = this.projectSnapshot.connections
-        .filter(c => c.source === clientNode.id && (c.type === "routes_to" || c.type === "dependency"))
-        .map(c => c.target);
+      if (lbNode) {
+        candidateIds = this.projectSnapshot.connections
+          .filter(c => c.source === lbNode!.id && c.type === "routes_to")
+          .map(c => c.target);
 
-      if (candidateIds.length === 0) {
-        candidateIds = this.projectSnapshot.resources
-          .filter(r => r.id !== clientNode.id)
-          .map(r => r.id);
+        if (candidateIds.length === 0) {
+          candidateIds = this.projectSnapshot.resources
+            .filter(r => r.type === "backend" || r.type === "service" || r.type === "container" || r.type === "pod")
+            .map(r => r.id);
+        }
+      } else {
+        candidateIds = this.projectSnapshot.connections
+          .filter(c => c.source === clientNode.id && (c.type === "routes_to" || c.type === "dependency"))
+          .map(c => c.target);
+
+        if (candidateIds.length === 0) {
+          candidateIds = this.projectSnapshot.resources
+            .filter(r => r.id !== clientNode.id)
+            .map(r => r.id);
+        }
       }
     }
 
@@ -375,15 +562,20 @@ export class SimulationEngine {
       if (edgeToLb) this.activeEdgeIds.add(edgeToLb.id);
     }
 
-    // Route request
+    // Build resource names dictionary including all dynamic replicas
     const resourceNames: Record<string, string> = {};
     for (const r of this.projectSnapshot.resources) {
       resourceNames[r.id] = r.configuration?.name || r.name || r.id;
     }
+    for (const rep of allReplicas) {
+      resourceNames[rep.id] = rep.name;
+    }
+
+    const routingStates = this.getRoutingResourceStates();
 
     const routingDecision = this.currentAlgorithm.selectTarget(
       candidateIds,
-      this.resourceStates,
+      routingStates,
       {
         tick: this.currentTick,
         requestId: req.id,
@@ -416,13 +608,20 @@ export class SimulationEngine {
     req.startedAtTick = this.currentTick;
     req.path.push(routingDecision.selectedTargetId);
 
-    // Active edge from LB (or client) to Target
+    // Active edge from LB (or client) to Target:
+    // If target is a replica, map to its base resource for visual flow edge
+    const rep = this.autoscalingEngine?.getReplica(routingDecision.selectedTargetId);
+    const connectionTargetId = rep ? rep.baseResourceId : routingDecision.selectedTargetId;
+
     const sourceNodeId = lbNode ? lbNode.id : clientNode.id;
-    const edgeToTarget = this.findConnection(sourceNodeId, routingDecision.selectedTargetId);
+    const edgeToTarget = this.findConnection(sourceNodeId, connectionTargetId);
     if (edgeToTarget) this.activeEdgeIds.add(edgeToTarget.id);
 
-    // Increment backend active count
-    const backendState = this.resourceStates.get(routingDecision.selectedTargetId);
+    // Increment replica and backend active count
+    if (this.autoscalingEngine) {
+      this.autoscalingEngine.onReplicaRequestAssigned(routingDecision.selectedTargetId);
+    }
+    const backendState = this.resourceStates.get(connectionTargetId);
     if (backendState) {
       backendState.activeRequests++;
       backendState.handledRequests++;
@@ -447,13 +646,15 @@ export class SimulationEngine {
     });
 
     // Check if target backend has a database/cache connection
-    const dbConn = this.projectSnapshot.connections.find(
-      c => c.source === routingDecision.selectedTargetId && (c.type === "uses" || c.type === "dependency")
-    );
-    if (dbConn) {
-      req.databaseNodeId = dbConn.target;
-      req.path.push(dbConn.target);
-      this.activeEdgeIds.add(dbConn.id);
+    const dbTargetId = rep?.databaseNodeId || this.projectSnapshot.connections.find(
+      c => c.source === connectionTargetId && (c.type === "uses" || c.type === "dependency")
+    )?.target;
+
+    if (dbTargetId) {
+      req.databaseNodeId = dbTargetId;
+      req.path.push(dbTargetId);
+      const dbEdge = this.findConnection(connectionTargetId, dbTargetId);
+      if (dbEdge) this.activeEdgeIds.add(dbEdge.id);
     }
   }
 
@@ -464,16 +665,30 @@ export class SimulationEngine {
     for (const req of this.requests) {
       if (req.state !== "in_progress") continue;
 
-      const backendState = req.targetNodeId ? this.resourceStates.get(req.targetNodeId) : undefined;
+      const replica = req.targetNodeId && this.autoscalingEngine
+        ? this.autoscalingEngine.getReplica(req.targetNodeId)
+        : undefined;
+      const baseId = replica ? replica.baseResourceId : req.targetNodeId;
+      const backendState = baseId ? this.resourceStates.get(baseId) : undefined;
 
-      // Check if backend died while processing request
-      if (backendState && (backendState.isFailed || backendState.state === "unavailable" || backendState.state === "failed")) {
+      // Check if backend or replica died while processing request
+      const isFailed = (replica && replica.isFailed) ||
+        (backendState && (backendState.isFailed || backendState.state === "unavailable" || backendState.state === "failed"));
+
+      if (isFailed) {
         req.state = "failed";
-        req.error = `Backend instance "${backendState.name}" failed during request processing.`;
+        const targetName = replica?.name || backendState?.name || "Target Instance";
+        req.error = `Backend instance "${targetName}" failed during request processing.`;
         req.completedAtTick = this.currentTick;
         req.latencyTicks = this.currentTick - req.createdAtTick;
-        backendState.failedRequests++;
-        backendState.activeRequests = Math.max(0, backendState.activeRequests - 1);
+
+        if (req.targetNodeId && this.autoscalingEngine) {
+          this.autoscalingEngine.onReplicaRequestCompleted(req.targetNodeId, false);
+        }
+        if (backendState) {
+          backendState.failedRequests++;
+          backendState.activeRequests = Math.max(0, backendState.activeRequests - 1);
+        }
 
         this.emitEvent({
           category: "failure",
@@ -481,7 +696,7 @@ export class SimulationEngine {
           requestId: req.id,
           resourceId: req.targetNodeId,
           severity: "ERROR",
-          message: `Request ${req.id} failed: target instance "${backendState.name}" became unavailable.`
+          message: `Request ${req.id} failed: target instance "${targetName}" became unavailable.`
         });
         continue;
       }
@@ -493,6 +708,9 @@ export class SimulationEngine {
         req.completedAtTick = this.currentTick;
         req.latencyTicks = this.currentTick - req.createdAtTick;
 
+        if (req.targetNodeId && this.autoscalingEngine) {
+          this.autoscalingEngine.onReplicaRequestCompleted(req.targetNodeId, true);
+        }
         if (backendState) {
           backendState.activeRequests = Math.max(0, backendState.activeRequests - 1);
           if (backendState.activeRequests === 0 && !backendState.isFailed) {
@@ -513,19 +731,24 @@ export class SimulationEngine {
           });
         }
 
+        const targetName = replica?.name || backendState?.name || req.targetNodeId;
         this.emitEvent({
           category: "request",
           type: "REQUEST_COMPLETED",
           requestId: req.id,
           resourceId: req.targetNodeId,
           severity: "SUCCESS",
-          message: `Request ${req.id} completed successfully in ${req.latencyTicks} ticks (${processingTicks} ticks processing).`
+          message: `Request ${req.id} completed successfully by "${targetName}" in ${req.latencyTicks} ticks (${processingTicks} ticks processing).`
         });
       } else {
         // Still processing: keep active path visible
         this.activeRequestPaths.push([...req.path]);
         for (let i = 0; i < req.path.length - 1; i++) {
-          const conn = this.findConnection(req.path[i], req.path[i + 1]);
+          const repFrom = this.autoscalingEngine?.getReplica(req.path[i]);
+          const repTo = this.autoscalingEngine?.getReplica(req.path[i + 1]);
+          const fromId = repFrom ? repFrom.baseResourceId : req.path[i];
+          const toId = repTo ? repTo.baseResourceId : req.path[i + 1];
+          const conn = this.findConnection(fromId, toId);
           if (conn) this.activeEdgeIds.add(conn.id);
         }
       }
@@ -537,38 +760,56 @@ export class SimulationEngine {
    */
   public injectFailure(resourceId: string, reason: string = "Simulated node crash / outage"): SimulationSnapshot {
     const res = this.resourceStates.get(resourceId);
-    if (!res) return this.getSnapshot();
+    if (res) {
+      res.isFailed = true;
+      res.state = "unavailable";
+      res.failureReason = reason;
+      this.failureCount++;
+    }
 
-    res.isFailed = true;
-    res.state = "unavailable";
-    res.failureReason = reason;
-    this.failureCount++;
+    if (this.autoscalingEngine) {
+      this.autoscalingEngine.injectReplicaFailure(resourceId, reason);
+      for (const rep of this.autoscalingEngine.getAllReplicas()) {
+        if (rep.baseResourceId === resourceId) {
+          this.autoscalingEngine.injectReplicaFailure(rep.id, reason);
+        }
+      }
+    }
 
     this.emitEvent({
       category: "failure",
       type: "RESOURCE_FAILED",
       resourceId,
       severity: "ERROR",
-      message: `FAILURE INJECTED: Resource "${res.name}" crashed or became unavailable. Reason: ${reason}`
+      message: `FAILURE INJECTED: Resource "${res?.name || resourceId}" crashed or became unavailable. Reason: ${reason}`
     });
 
-    // Terminate any active requests currently assigned to this failed instance
+    // Terminate any active requests currently assigned to this failed instance or replica
     for (const req of this.requests) {
-      if (req.state === "in_progress" && req.targetNodeId === resourceId) {
+      const isTarget = req.targetNodeId === resourceId ||
+        (req.targetNodeId && this.autoscalingEngine?.getReplica(req.targetNodeId)?.baseResourceId === resourceId);
+
+      if (req.state === "in_progress" && isTarget) {
         req.state = "failed";
         req.error = `Interrupted by host failure: ${reason}`;
         req.completedAtTick = this.currentTick;
         req.latencyTicks = this.currentTick - req.createdAtTick;
-        res.failedRequests++;
-        res.activeRequests = Math.max(0, res.activeRequests - 1);
+
+        if (req.targetNodeId && this.autoscalingEngine) {
+          this.autoscalingEngine.onReplicaRequestCompleted(req.targetNodeId, false);
+        }
+        if (res) {
+          res.failedRequests++;
+          res.activeRequests = Math.max(0, res.activeRequests - 1);
+        }
 
         this.emitEvent({
           category: "failure",
           type: "REQUEST_INTERRUPTED_BY_CRASH",
           requestId: req.id,
-          resourceId,
+          resourceId: req.targetNodeId,
           severity: "ERROR",
-          message: `Request ${req.id} was aborted due to crash of instance "${res.name}".`
+          message: `Request ${req.id} was aborted due to crash of instance "${res?.name || resourceId}".`
         });
       }
     }
@@ -581,19 +822,28 @@ export class SimulationEngine {
    */
   public recoverResource(resourceId: string): SimulationSnapshot {
     const res = this.resourceStates.get(resourceId);
-    if (!res) return this.getSnapshot();
+    if (res) {
+      res.isFailed = false;
+      res.state = "ready";
+      res.failureReason = undefined;
+      this.recoveryCount++;
+    }
 
-    res.isFailed = false;
-    res.state = "ready";
-    res.failureReason = undefined;
-    this.recoveryCount++;
+    if (this.autoscalingEngine) {
+      this.autoscalingEngine.recoverReplica(resourceId);
+      for (const rep of this.autoscalingEngine.getAllReplicas()) {
+        if (rep.baseResourceId === resourceId) {
+          this.autoscalingEngine.recoverReplica(rep.id);
+        }
+      }
+    }
 
     this.emitEvent({
       category: "recovery",
       type: "RESOURCE_RECOVERED",
       resourceId,
       severity: "SUCCESS",
-      message: `RECOVERY: Resource "${res.name}" has restored health and returned to eligible pool.`
+      message: `RECOVERY: Resource "${res?.name || resourceId}" has restored health and returned to eligible pool.`
     });
 
     return this.getSnapshot();
@@ -639,10 +889,17 @@ export class SimulationEngine {
     const perBackendRequests: Record<string, number> = {};
     const perBackendActive: Record<string, number> = {};
 
-    for (const [id, res] of this.resourceStates.entries()) {
-      if (res.handledRequests > 0 || res.activeRequests > 0 || res.type === "backend") {
-        perBackendRequests[res.name || id] = res.handledRequests;
-        perBackendActive[res.name || id] = res.activeRequests;
+    if (this.autoscalingEngine && this.autoscalingEngine.getAllReplicas().length > 0) {
+      for (const rep of this.autoscalingEngine.getAllReplicas()) {
+        perBackendRequests[rep.name] = rep.handledRequests;
+        perBackendActive[rep.name] = rep.activeRequests;
+      }
+    } else {
+      for (const [id, res] of this.resourceStates.entries()) {
+        if (res.handledRequests > 0 || res.activeRequests > 0 || res.type === "backend") {
+          perBackendRequests[res.name || id] = res.handledRequests;
+          perBackendActive[res.name || id] = res.activeRequests;
+        }
       }
     }
 
@@ -672,15 +929,24 @@ export class SimulationEngine {
       .reverse()
       .find(r => r.routingDecision)?.routingDecision;
 
+    const replicasRecord: Record<string, VirtualReplica> = {};
+    if (this.autoscalingEngine) {
+      for (const rep of this.autoscalingEngine.getAllReplicas()) {
+        replicasRecord[rep.id] = { ...rep };
+      }
+    }
+
     return {
       status: this.status,
       currentTick: this.currentTick,
       currentStageIndex: this.currentStageIndex,
       totalStages: this.plan.stages.length,
       resources: resourcesRecord,
+      virtualReplicas: replicasRecord,
       requests: [...this.requests],
       events: [...this.events],
       metrics: this.computeMetrics(),
+      autoscaling: this.autoscalingEngine ? this.autoscalingEngine.getMetrics(this.currentTick) : undefined,
       activeEdgeIds: Array.from(this.activeEdgeIds),
       activeRequestPaths: [...this.activeRequestPaths],
       config: { ...this.config },
@@ -704,9 +970,14 @@ export class SimulationEngine {
   }
 
   private findConnection(sourceId: string, targetId: string): WorkflowConnection | undefined {
+    const repSource = this.autoscalingEngine?.getReplica(sourceId);
+    const repTarget = this.autoscalingEngine?.getReplica(targetId);
+    const sId = repSource ? repSource.baseResourceId : sourceId;
+    const tId = repTarget ? repTarget.baseResourceId : targetId;
+
     return this.projectSnapshot.connections.find(
-      c => (c.source === sourceId && c.target === targetId) ||
-           (c.source === targetId && c.target === sourceId)
+      c => (c.source === sId && c.target === tId) ||
+           (c.source === tId && c.target === sId)
     );
   }
 }
